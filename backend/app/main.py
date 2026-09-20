@@ -2,7 +2,7 @@ import asyncio, time, random, math, json, threading
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 app = FastAPI(title="Grid Trading Engine")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -12,12 +12,37 @@ SIM_RUNNING = True
 current_price = 100.0
 ticks_history = []
 
+# 参数允许范围（与前端输入框约束一致）
+LIMITS = {
+    "lowerPrice": (50, 200, "下限价格"),
+    "upperPrice": (50, 200, "上限价格"),
+    "gridCount": (5, 50, "网格数量"),
+    "capitalPerGrid": (100, 50000, "每格资金"),
+    "initialCapital": (10000, 1000000, "初始资金"),
+}
+
+
 class GridConfig(BaseModel):
     lowerPrice: float = 95
     upperPrice: float = 115
     gridCount: int = 20
     capitalPerGrid: float = 1000
     initialCapital: float = 100000
+
+
+def validate_config(c: GridConfig):
+    """返回中文错误描述；合法时返回 None。"""
+    for field, (lo, hi, label) in LIMITS.items():
+        v = getattr(c, field)
+        if not isinstance(v, (int, float)) or not math.isfinite(v):
+            return f"{label}必须是有限数值（当前 {v}）"
+        if v < lo or v > hi:
+            return f"{label}必须介于 {lo:g} 和 {hi:g} 之间（当前 {v:g}）"
+    if c.gridCount != int(c.gridCount):
+        return "网格数量必须为整数"
+    if c.lowerPrice >= c.upperPrice:
+        return f"下限价格必须小于上限价格（当前 {c.lowerPrice:g} >= {c.upperPrice:g}）"
+    return None
 
 
 def simulate_market():
@@ -56,16 +81,16 @@ async def startup():
     threading.Thread(target=simulate_market, daemon=True).start()
 
 
-@app.post("/api/backtest")
-def run_backtest(config: GridConfig):
+def execute_backtest(config: GridConfig):
+    """回测核心逻辑。使用独立随机源，保证同一参数无论何时运行结果一致。"""
     step = (config.upperPrice - config.lowerPrice) / config.gridCount
     grid_prices = [config.lowerPrice + i * step for i in range(config.gridCount + 1)]
 
-    # Simulate prices
-    np.random.seed(42)
+    # Simulate prices（固定种子 + 独立随机源，不受行情线程影响）
+    rng = random.Random(42)
     prices = [100]
     for _ in range(200):
-        prices.append(prices[-1] + random.gauss(0, 1.2))
+        prices.append(prices[-1] + rng.gauss(0, 1.2))
     prices = [max(70, min(140, p)) for p in prices]
 
     buy_grids = {}  # price -> True (buy order placed)
@@ -106,7 +131,7 @@ def run_backtest(config: GridConfig):
     return_rate = (total_profit / config.initialCapital) * 100
 
     # Sharpe ratio
-    eq_returns = np.diff(equity_curve) / np.array(equity_curve[:-1] + 1e-5)
+    eq_returns = np.diff(equity_curve) / (np.array(equity_curve[:-1]) + 1e-5)
     sharpe = float(np.mean(eq_returns) / max(np.std(eq_returns), 1e-5) * np.sqrt(252)) if len(eq_returns) > 1 else 0
 
     # Max drawdown
@@ -129,8 +154,68 @@ def run_backtest(config: GridConfig):
         "sharpeRatio": round(sharpe, 2),
         "maxDrawdown": round(max_dd, 2),
         "winRate": round(win_rate, 1),
+        "tradeCount": total,
         "equityCurve": equity_curve
     }
+
+
+@app.post("/api/backtest")
+def run_backtest(config: GridConfig):
+    error = validate_config(config)
+    if error:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail=error)
+    return execute_backtest(config)
+
+
+@app.post("/api/backtest/batch")
+def run_backtest_batch(payload: dict):
+    """批量回测：逐项校验越界/重复，跳过有问题的组合，其余照常运行，不会整批失败。"""
+    raw_configs = payload.get("configs")
+    if not isinstance(raw_configs, list) or not raw_configs:
+        return {"results": [], "skipped": [{"index": None, "config": None, "reason": "configs 必须为非空数组"}]}
+
+    results, skipped = [], []
+    seen = {}  # (下限, 上限, 网格数, 每格资金) -> 首次出现的组号(1-based)
+
+    for i, raw in enumerate(raw_configs, start=1):
+        if not isinstance(raw, dict):
+            skipped.append({"index": i, "config": raw, "reason": f"参数必须为对象（实际为 {type(raw).__name__}）"})
+            continue
+        try:
+            config = GridConfig(**raw)
+        except (ValidationError, TypeError, ValueError) as e:
+            skipped.append({"index": i, "config": raw,
+                            "reason": f"参数格式有误：{e.errors()[0]['msg'] if e.errors() else str(e)}"})
+            continue
+
+        error = validate_config(config)
+        if error:
+            skipped.append({"index": i, "config": json.loads(config.model_dump_json()), "reason": error})
+            continue
+
+        key = (config.lowerPrice, config.upperPrice, config.gridCount, config.capitalPerGrid)
+        if key in seen:
+            skipped.append({"index": i, "config": json.loads(config.model_dump_json()),
+                            "reason": f"与第 {seen[key]} 组参数完全重复（下限/上限/网格数量/每格资金相同）"})
+            continue
+        seen[key] = i
+
+        r = execute_backtest(config)
+        results.append({
+            "index": i,
+            "config": json.loads(config.model_dump_json()),
+            "metrics": {
+                "returnRate": r["returnRate"],
+                "maxDrawdown": r["maxDrawdown"],
+                "sharpeRatio": r["sharpeRatio"],
+                "tradeCount": r["tradeCount"],
+                "totalProfit": r["totalProfit"],
+                "winRate": r["winRate"],
+            }
+        })
+
+    return {"results": results, "skipped": skipped}
 
 
 @app.websocket("/ws")
@@ -139,5 +224,5 @@ async def ws_endpoint(ws: WebSocket):
     ACTIVE_CLIENTS.append(ws)
     try:
         while True: await ws.receive_text()
-    except: 
+    except:
         if ws in ACTIVE_CLIENTS: ACTIVE_CLIENTS.remove(ws)
