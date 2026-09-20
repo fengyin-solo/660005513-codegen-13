@@ -26,10 +26,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, onMounted, onUnmounted } from 'vue'
+import { ref, watch, onUnmounted } from 'vue'
 import * as echarts from 'echarts'
 import { useTradingStore } from '../store/trading'
-const store = useTradingStore(); const eqChart = ref<HTMLDivElement>(); let inst: echarts.ECharts|null=null
+const store = useTradingStore(); const eqChart = ref<HTMLDivElement>(); let inst: echarts.ECharts|null = null
 
 function updateEq() {
   if (!inst||!store.gridResult) return
@@ -43,7 +43,10 @@ function updateEq() {
     }],animation:false
   })
 }
-watch(()=>store.gridResult,(r)=>{if(r) setTimeout(updateEq,50)})
+watch(()=>store.gridResult,(r)=>{
+  if(!r) return
+  setTimeout(()=>{ if(eqChart.value && !inst) inst = echarts.init(eqChart.value); updateEq() },50)
+})
 onUnmounted(()=>inst?.dispose())
 </script>
 
